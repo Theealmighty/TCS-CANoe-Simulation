@@ -1,0 +1,180 @@
+/*@!Encoding:1252*/
+/*=============================================================================
+  ECU:         Wheel_Speed_Module
+  File:        Wheel_Speed_Module.can
+  Function:    Advanced physical simulation. Gradually ramps vehicle speed and
+               wheel RPMs. Brake pedal now proportionally reduces the TARGET
+               speed (fighting against throttle) instead of endlessly
+               subtracting from current speed — so a light brake with throttle
+               still applied settles at a reduced speed instead of crashing to
+               zero. Full brake (100%) still forces target to zero for a hard
+               stop. Includes a 10-second auto-brake fail-safe.
+=============================================================================*/
+
+variables {
+  msTimer t_WheelSpeedTx;
+  const int C_TX_PERIOD_MS = 20; // 50 Hz transmission
+
+  double vehSpeed = 0.0;
+  double fl_rpm = 0.0, fr_rpm = 0.0, rl_rpm = 0.0, rr_rpm = 0.0;
+
+  double throttleIn = 0.0;
+  double brakeIn = 0.0;
+  double muIn = 0.8;
+  double steerIn = 0.0;
+  int ignitionIn = 0;
+
+  int tcsIntervention = 0;
+  double tcsTorqueDerate = 0.0;
+
+  double slipTimerMs = 0.0;
+  int autoBrakeActive = 0;
+
+  const double C_BRAKE_MIN_RATE = 0.05; // Lightest brake touch: gentle pull-down
+  const double C_BRAKE_MAX_RATE = 4.0;  // Full brake pedal: hard stop
+}
+
+on start {
+  setTimer(t_WheelSpeedTx, C_TX_PERIOD_MS);
+  write("[INIT] Wheel_Speed_Module active. Direct UI physics linked.");
+}
+
+/* Listen to the Master Node for TCS Torque cuts */
+on message TCS_Control_Msg {
+  tcsIntervention = this.Intervention_State;
+  tcsTorqueDerate = this.Torque_Derate_Req;
+}
+
+on timer t_WheelSpeedTx {
+  message Wheel_Speed_FL msgFL;
+  message Wheel_Speed_FR msgFR;
+  message Wheel_Speed_Rear msgRear;
+
+  double targetSpeed;
+  double effectiveThrottle;
+  double slipThreshold;
+  double targetRearRpm;
+  double brakeFactor;
+  double rampRate;
+
+  // 1. DIRECT PANEL LINK (Bypasses CAN bus delays for 100% reliability)
+  throttleIn = @TCS_Vars::SysVar_Throttle;
+  brakeIn    = @TCS_Vars::SysVar_BrakePedal;
+  muIn       = @TCS_Vars::SysVar_SurfaceMu;
+  steerIn    = @TCS_Vars::SysVar_SteeringAngle;
+  ignitionIn = @TCS_Vars::SysVar_Ignition;
+
+  // FAIL-SAFE: Car will not move unless Ignition is ON (2)
+  if (ignitionIn != 2) {
+    throttleIn = 0.0;
+  }
+
+  // 2. Calculate Effective Throttle (TCS cuts power during intervention)
+  if (tcsIntervention == 1) {
+    effectiveThrottle = throttleIn * (1.0 - (tcsTorqueDerate / 100.0));
+  } else {
+    effectiveThrottle = throttleIn;
+  }
+
+  // 3. BRAKE NOW REDUCES THE TARGET SPEED PROPORTIONALLY, instead of
+  //    endlessly subtracting from current speed. 0% brake = no effect,
+  //    100% brake = target forced to 0 (hard stop).
+  brakeFactor = brakeIn / 100.0; // 0.0 .. 1.0
+  targetSpeed = (effectiveThrottle * 2.5) * (1.0 - brakeFactor);
+
+  // 4. Slip Detection & 10-Second Auto-Brake Timer
+  slipThreshold = muIn * 100.0;
+
+  if (throttleIn > slipThreshold) {
+    if (brakeIn > 0.5) { // Using 0.5 as a buffer for any slider noise
+      // Manual brake applied -> Reset the fail-safe timer
+      slipTimerMs = 0.0;       
+      autoBrakeActive = 0;
+    } else {
+      // No manual brake -> Count up 
+      slipTimerMs = slipTimerMs + C_TX_PERIOD_MS;
+      if (slipTimerMs >= 10000.0) { // 10 seconds elapsed
+        autoBrakeActive = 1;
+      }
+    }
+  } else {
+    // Normal driving -> Reset timer
+    slipTimerMs = 0.0;
+    autoBrakeActive = 0;
+  }
+
+  // 5. Gradual Vehicle Speed Physics — ramps toward targetSpeed. When the
+  //    brake is the reason target dropped, use a stronger, brake-proportional
+  //    ramp rate so it still FEELS like braking, not just coasting off the gas.
+  if (autoBrakeActive == 1) {
+    vehSpeed = vehSpeed - 0.5; // Gradual auto-braking (fail-safe)
+    if (vehSpeed < 0.0) vehSpeed = 0.0;
+  } else if (vehSpeed > targetSpeed) {
+    if (brakeIn > 0.5) {
+      rampRate = C_BRAKE_MIN_RATE + (brakeFactor * (C_BRAKE_MAX_RATE - C_BRAKE_MIN_RATE));
+    } else {
+      rampRate = 0.2; // Normal coast-down when just releasing throttle
+    }
+    vehSpeed = vehSpeed - rampRate;
+    if (vehSpeed < targetSpeed) vehSpeed = targetSpeed;
+  } else if (vehSpeed < targetSpeed) {
+    vehSpeed = vehSpeed + 0.3; // Gradual acceleration
+    if (vehSpeed > targetSpeed) vehSpeed = targetSpeed;
+  }
+
+  // 6. Gradual Wheel RPM Physics
+  fl_rpm = vehSpeed * 10.0; // Front wheels track vehicle speed perfectly
+  fr_rpm = vehSpeed * 10.0;
+
+  targetRearRpm = vehSpeed * 10.0; // Base target for rear wheels
+
+  // Add aggressive wheel spin if slipping, UNLESS brakes are actively applied
+  if (throttleIn > slipThreshold && brakeIn < 0.5 && autoBrakeActive == 0) {
+    double excess;
+    double slipGain;
+    
+    excess = throttleIn - slipThreshold;
+    slipGain = (1.0 - muIn) * 3.0;
+    
+    targetRearRpm = targetRearRpm + (excess * slipGain * 2.0);
+  }
+
+  // Smoothly ramp actual Rear RPM toward target to prevent instantly snapping gauges
+  if (rl_rpm < targetRearRpm) {
+    rl_rpm = rl_rpm + 15.0; // Spool up speed
+    if (rl_rpm > targetRearRpm) rl_rpm = targetRearRpm;
+  } else if (rl_rpm > targetRearRpm) {
+    rl_rpm = rl_rpm - 25.0; // Spool down speed (brakes catch faster)
+    if (rl_rpm < targetRearRpm) rl_rpm = targetRearRpm;
+  }
+  
+  rr_rpm = rl_rpm; // Keep symmetric for this simulation
+
+  // 7. Pack CAN Messages
+  msgFL.FL_RPM = fl_rpm;
+  msgFL.FL_Speed_Kmh = vehSpeed;
+  msgFL.FL_Sensor_Status = (@TCS_Vars::SysVar_WheelSensorFault == 1) ? 0 : 1;
+  msgFL.FL_Direction = 1;
+
+  msgFR.FR_RPM = fr_rpm;
+  msgFR.FR_Speed_Kmh = vehSpeed;
+  msgFR.FR_Sensor_Status = (@TCS_Vars::SysVar_WheelSensorFault == 1) ? 0 : 1;
+  msgFR.FR_Direction = 1;
+
+  msgRear.RL_RPM = rl_rpm;
+  msgRear.RR_RPM = rr_rpm;
+  msgRear.Vehicle_Ref_Speed = vehSpeed;
+  msgRear.Yaw_Rate = steerIn * 0.1;
+
+  msgFL.FL_Pulse_Count = fl_rpm * 5.0;
+  msgFR.FR_Pulse_Count = fr_rpm * 5.0;
+
+  // 8. Output to CAN and Panel UI
+  output(msgFL);
+  output(msgFR);
+  output(msgRear);
+
+  @TCS_Vars::SysVar_VehicleSpeed = vehSpeed;
+
+  setTimer(t_WheelSpeedTx, C_TX_PERIOD_MS);
+}

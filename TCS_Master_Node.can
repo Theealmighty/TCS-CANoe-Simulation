@@ -1,0 +1,244 @@
+/*@!Encoding:1252*/
+/*=============================================================================
+  ECU:         TCS_Master_Node
+  File:        TCS_Master_Node.can
+  Function:    Calculates wheel slip continuously, scaled by surface grip
+               (Mu). Drives the status banner, warning text, tire LEDs, the
+               4-way surface picture, and the TCS torque/brake intervention.
+               Also includes ISO 14229 UDS Diagnostic Responder logic.
+=============================================================================*/
+
+variables {
+  message 0x7E8 msgDiagResponse;
+  msTimer t_TcsTx;
+  const int C_TX_PERIOD_MS = 20; // 50 Hz transmission
+
+  // Wheel speed data
+  double refSpeed = 0.0;
+  double rl_rpm = 0.0;
+  double rr_rpm = 0.0;
+
+  // TCS States
+  double max_slip = 0.0;
+  int tcs_disabled = 0;
+  int ignition = 0;
+}
+
+on start {
+  setTimer(t_TcsTx, C_TX_PERIOD_MS);
+  updateSurfaceImage();
+  write("[INIT] TCS_Master_Node active. Continuous grip-based slip logic enabled.");
+}
+
+/* 1. Read the driver's button/ignition state */
+on message Driver_Input_Msg {
+  tcs_disabled = this.TCS_Off_Switch;
+  ignition = this.Ignition_Status;
+}
+
+/* 2. Read the rear wheel speeds */
+on message Wheel_Speed_Rear {
+  refSpeed = this.Vehicle_Ref_Speed;
+  rl_rpm = this.RL_RPM;
+  rr_rpm = this.RR_RPM;
+}
+
+/* 3. Cyclic timer: continuous slip logic + intervention + status banner */
+on timer t_TcsTx {
+  message TCS_Control_Msg msgCtrl;
+  message TCS_Brake_Msg msgTcsBrake;
+
+  double currentThrottle;
+  double currentMu;
+  double slipThreshold, slipGain;
+  int level; // banner level: 0=OK, 1=Warning, 2=Danger
+
+  currentThrottle = @TCS_Vars::SysVar_Throttle;
+  currentMu = @TCS_Vars::SysVar_SurfaceMu;
+
+  // --- CONTINUOUS SLIP LOGIC: scales with actual Mu, not a hard on/off ---
+  slipThreshold = currentMu * 100.0;
+  slipGain      = (1.0 - currentMu) * 1.2;
+
+  if (currentThrottle > slipThreshold) {
+    max_slip = (currentThrottle - slipThreshold) * (1.0 + slipGain);
+
+    if (tcs_disabled == 1) {
+      sysSetVariableString(sysvar::TCS_Vars::SysVar_WarningMessage, "WARNING: Wheel Slip Detected — TCS OFF, No Intervention.");
+    } else if (ignition != 2) {
+      sysSetVariableString(sysvar::TCS_Vars::SysVar_WarningMessage, "WARNING: Wheel Slip Detected — Ignition Not On.");
+    } else if (currentMu <= 0.3) {
+      sysSetVariableString(sysvar::TCS_Vars::SysVar_WarningMessage, "DANGER: Ice Slip! TCS Active.");
+    } else if (currentMu <= 0.5) {
+      sysSetVariableString(sysvar::TCS_Vars::SysVar_WarningMessage, "WARNING: Snow Slip! TCS Active.");
+    } else if (currentMu <= 0.7) {
+      sysSetVariableString(sysvar::TCS_Vars::SysVar_WarningMessage, "WARNING: Wet-Road Slip! TCS Active.");
+    } else {
+      sysSetVariableString(sysvar::TCS_Vars::SysVar_WarningMessage, "WARNING: High-Speed Slip! TCS Active.");
+    }
+  } else {
+    max_slip = 0.0;
+    sysSetVariableString(sysvar::TCS_Vars::SysVar_WarningMessage, "Status: Normal Driving.");
+  }
+
+  // Update the CANoe Dashboard UI gauge
+  @TCS_Vars::SysVar_CurrentSlipRatio = max_slip;
+
+  // --- STATUS BANNER ---
+  if (max_slip > 15.0 && tcs_disabled == 0 && ignition == 2) {
+    level = 2;
+  } else if (currentMu <= 0.5 || max_slip > 0.0) {
+    level = 1;
+  } else {
+    level = 0;
+  }
+  setBanner(level);
+
+  // --- TRACTION CONTROL INTERVENTION LOGIC ---
+  if (max_slip > 15.0 && tcs_disabled == 0 && ignition == 2) {
+
+    // Intervene: Ask engine to cut torque by 50%
+    msgCtrl.Torque_Derate_Req = 50;
+    msgCtrl.Intervention_State = 1;
+    msgCtrl.TCS_Warning_Lamp = 1;
+
+    // Panel Visuals: Main Slip LED and Red Tire LEDs ON
+    @TCS_Vars::SysVar_SlipWarningLED = 1;
+    @TCS_Vars::SysVar_TireSlip_RL = 1;
+    @TCS_Vars::SysVar_TireSlip_RR = 1;
+
+    // Activate Brake Pump
+    msgTcsBrake.Target_Wheel_ID = 3; // Rear Axle
+    msgTcsBrake.Brake_Valves_Active = 1;
+    msgTcsBrake.Brake_Pump_Request = 1;
+
+  } else {
+    // Normal Driving
+    msgCtrl.Torque_Derate_Req = 0;
+    msgCtrl.Intervention_State = 0;
+    msgCtrl.TCS_Warning_Lamp = 0;
+
+    // Panel Visuals: LEDs OFF
+    @TCS_Vars::SysVar_SlipWarningLED = 0;
+    @TCS_Vars::SysVar_TireSlip_RL = 0;
+    @TCS_Vars::SysVar_TireSlip_RR = 0;
+
+    // Deactivate Brake Pump
+    msgTcsBrake.Target_Wheel_ID = 0;
+    msgTcsBrake.Brake_Valves_Active = 0;
+    msgTcsBrake.Brake_Pump_Request = 0;
+  }
+
+  // --- FILL UNUSED SIGNALS FOR 100% DBC LOGGING ---
+  msgCtrl.Max_Slip_Ratio = max_slip;
+  msgCtrl.System_Fault_Flag = (@TCS_Vars::SysVar_WheelSensorFault == 1) ? 1 : 0;
+  msgCtrl.FL_Slip_Ratio = 0.0;
+  msgCtrl.FR_Slip_Ratio = 0.0;
+
+  msgTcsBrake.FL_Brake_Press_Req = 0;
+  msgTcsBrake.FR_Brake_Press_Req = 0;
+
+  // Transmit commands
+  output(msgCtrl);
+  output(msgTcsBrake);
+
+  // Re-arm timer
+  setTimer(t_TcsTx, C_TX_PERIOD_MS);
+}
+
+/* --- STATUS BANNER: shows exactly one of the three panel banner texts --- */
+void setBanner(int lvl)
+{
+  SetControlVisibility("TCS_Main_Dashboard", "Banner_OK",     lvl == 0);
+  SetControlVisibility("TCS_Main_Dashboard", "Banner_Warn",   lvl == 1);
+  SetControlVisibility("TCS_Main_Dashboard", "Banner_Danger", lvl == 2);
+}
+
+
+/* --- 4-WAY SURFACE PICTURE SWITCH: shows exactly one of the four pictures --- */
+void updateSurfaceImage()
+{
+  int sc;
+  sc = @TCS_Vars::SysVar_Scenario;
+  SetControlVisibility("TCS_Main_Dashboard", "Pic_Asphalt", sc == 0);
+  SetControlVisibility("TCS_Main_Dashboard", "Pic_Wet",     sc == 1);
+  SetControlVisibility("TCS_Main_Dashboard", "Pic_Snow",    sc == 2);
+  SetControlVisibility("TCS_Main_Dashboard", "Pic_Ice",     sc == 3);
+}
+
+/* --- SCENARIO SELECTION: sets Mu and swaps the picture together --- */
+on sysvar TCS_Vars::SysVar_Scenario {
+  updateSurfaceImage();
+  switch (@this) {
+    case 0: @TCS_Vars::SysVar_SurfaceMu = 0.8;  break;  // Dry
+    case 1: @TCS_Vars::SysVar_SurfaceMu = 0.6;  break;  // Wet
+    case 2: @TCS_Vars::SysVar_SurfaceMu = 0.35; break;  // Snow
+    case 3: @TCS_Vars::SysVar_SurfaceMu = 0.2;  break;  // Ice
+  }
+} 
+
+/* --- UDS DIAGNOSTICS RESPONDER --- */
+on message 0x7E0 {
+  int serviceId;
+  int did_high;
+  int did_low;
+  
+  serviceId = this.byte(1);
+  did_high  = this.byte(2);
+  did_low   = this.byte(3);
+  
+  if (serviceId == 0x22 && did_high == 0x01 && did_low == 0x02) {
+    msgDiagResponse.dlc = 8;
+    msgDiagResponse.byte(0) = 0x04; // Length
+    msgDiagResponse.byte(1) = 0x62; // Positive Response
+    msgDiagResponse.byte(2) = 0x01; // DID High
+    msgDiagResponse.byte(3) = 0x02; // DID Low
+    
+    // Reply with the dashboard fault switch status
+    msgDiagResponse.byte(4) = @TCS_Vars::SysVar_WheelSensorFault; 
+    
+    output(msgDiagResponse);
+    write("[ECU] Processed Service 0x22 Read Request.");
+  }
+  else if (serviceId == 0x14) {
+    msgDiagResponse.dlc = 8; 
+    msgDiagResponse.byte(0) = 0x01; // Length: 1 byte
+    msgDiagResponse.byte(1) = 0x54; // Positive Response (14 + 40 hex)
+    msgDiagResponse.byte(2) = 0x00; 
+    msgDiagResponse.byte(3) = 0x00;
+    msgDiagResponse.byte(4) = 0x00;
+    msgDiagResponse.byte(5) = 0x00;
+    msgDiagResponse.byte(6) = 0x00;
+    msgDiagResponse.byte(7) = 0x00;
+    
+    // Clear the physical fault flag in the system
+    @TCS_Vars::SysVar_WheelSensorFault = 0; 
+    
+    output(msgDiagResponse);
+    write("[ECU] Memory Cleared. Positive Response 0x54 sent.");
+  }
+  else if (serviceId == 0x19 && did_high == 0x02) {
+    msgDiagResponse.dlc = 8; 
+    msgDiagResponse.byte(0) = 0x06; // Length: 6 bytes
+    msgDiagResponse.byte(1) = 0x59; // Positive Response (19 + 40 hex)
+    msgDiagResponse.byte(2) = 0x02; // Sub-function echo
+    
+    // If the fault switch is ON, report DTC C0035 (Wheel Speed Sensor)
+    if (@TCS_Vars::SysVar_WheelSensorFault == 1) {
+      msgDiagResponse.byte(3) = 0xC0; // DTC High byte
+      msgDiagResponse.byte(4) = 0x03; // DTC Middle byte
+      msgDiagResponse.byte(5) = 0x50; // DTC Low byte (Failure Type)
+      msgDiagResponse.byte(6) = 0x09; // Status (Confirmed)
+      write("[ECU] Fault Active. Reporting DTC C0035.");
+    } else {
+      // No faults active
+      msgDiagResponse.byte(0) = 0x02; // Length: 2 bytes
+      msgDiagResponse.byte(3) = 0x00; 
+      msgDiagResponse.byte(4) = 0x00;
+      msgDiagResponse.byte(5) = 0x00;
+      msgDiagResponse.byte(6) = 0x00;
+      write("[ECU] No Faults. Reporting 0 DTCs.");
+    }
+    output(msgDiagResponse);
+  }
+}

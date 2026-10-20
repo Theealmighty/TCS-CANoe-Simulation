@@ -1,0 +1,46 @@
+/*@!Encoding:1252*/
+/* Diagnostic Tester Node */
+variables 
+{
+  message 0x7E0 msgDiagRequest;
+}
+
+// 1. Read Data By Identifier (Service 0x22)
+on key 'd' 
+{
+  msgDiagRequest.dlc = 8; 
+  msgDiagRequest.byte(0) = 0x03; // Length
+  msgDiagRequest.byte(1) = 0x22; // Service: Read Data
+  msgDiagRequest.byte(2) = 0x01; // DID High
+  msgDiagRequest.byte(3) = 0x02; // DID Low
+  
+  output(msgDiagRequest);
+  write("[TESTER] Sent UDS Request for Fault Status (Service 22)");
+}
+
+// 2. Read DTC Information (Service 0x19)
+on key 'r' 
+{
+  msgDiagRequest.dlc = 8;
+  msgDiagRequest.byte(0) = 0x03; // Length
+  msgDiagRequest.byte(1) = 0x19; // Service: Read DTC
+  msgDiagRequest.byte(2) = 0x02; // Sub-function
+  msgDiagRequest.byte(3) = 0x09; // Status Mask
+  
+  output(msgDiagRequest);
+  write("[TESTER] Sent UDS Request to Read DTCs (Service 19)");
+}
+
+// 3. Clear Diagnostic Information (Service 0x14)
+on key 'c' 
+{
+  msgDiagRequest.dlc = 8;
+  msgDiagRequest.byte(0) = 0x04; // Length
+  msgDiagRequest.byte(1) = 0x14; // Service: Clear Diagnostics
+  msgDiagRequest.byte(2) = 0xFF; // Group High
+  msgDiagRequest.byte(3) = 0xFF; // Group Middle
+  msgDiagRequest.byte(4) = 0xFF; // Group Low
+  
+  output(msgDiagRequest);
+  write("[TESTER] Sent UDS Request to Clear All Faults (Service 14)");
+}

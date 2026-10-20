@@ -1,0 +1,84 @@
+/*@!Encoding:1252*/
+/*=============================================================================
+  ECU:         Powertrain_Brake_ECU
+  File:        Powertrain_Brake_ECU.can
+  Function:    Simulates Engine and Brake responses. Applies torque derate
+               when requested by the TCS Master Node.
+=============================================================================*/
+
+variables {
+  msTimer t_PtbTx;
+  const int C_TX_PERIOD_MS = 20; // 50 Hz transmission
+
+  // Received signals
+  double driverThrottle = 0.0;
+  double driverBrake = 0.0;
+  double torqueDerateReq = 0.0;
+  int tcsIntervention = 0;
+
+  // Output states
+  double actualTorque = 0.0;
+  double brakePressure = 0.0;
+}
+
+on start {
+  setTimer(t_PtbTx, C_TX_PERIOD_MS);
+  write("[INIT] Powertrain_Brake_ECU active. Awaiting torque requests.");
+}
+
+/* 1. Read the driver's pedal inputs */
+on message Driver_Input_Msg {
+  driverThrottle = this.Throttle_Pos;
+  driverBrake = this.Brake_Pedal_pos;
+}
+
+/* 2. Read the Master Node's intervention commands */
+on message TCS_Control_Msg {
+  torqueDerateReq = this.Torque_Derate_Req;
+  tcsIntervention = this.Intervention_State;
+}
+
+/* 3. Cyclic calculation of actual power and braking */
+on timer t_PtbTx {
+  message Powertrain_Status msgPt;
+  message Brake_Status_Msg msgBrake;
+
+  // --- ENGINE TORQUE CALCULATION ---
+  // Base torque from driver throttle (Assuming max 300 Nm engine)
+  actualTorque = driverThrottle * 3.0;
+
+  // Apply TCS Torque Derate (Cut power if tires are slipping)
+  if (tcsIntervention == 1 && torqueDerateReq > 0) {
+    actualTorque = actualTorque - (actualTorque * (torqueDerateReq / 100.0));
+  }
+
+  // --- BRAKE PRESSURE CALCULATION ---
+  // Base pressure from brake pedal (Assuming max 200 bar)
+  brakePressure = driverBrake * 2.0;
+
+  // --- UPDATE SYSTEM VARIABLES (For Dashboard UI) ---
+  @TCS_Vars::SysVar_ActualEngineTorque = actualTorque;
+  @TCS_Vars::SysVar_BrakePressureBar = brakePressure;
+  @TCS_Vars::SysVar_EngineRPM = 1000 + (actualTorque * 10); // Dashboard RPM box
+
+  // --- PACK POWERTRAIN MESSAGE (0x400) ---
+  msgPt.Engine_Torque_Actual = actualTorque;
+  msgPt.Engine_RPM = 1000 + (actualTorque * 10); // Simulated RPM curve
+  msgPt.Gear_Position = 1;
+  msgPt.Torque_Override_Ack = tcsIntervention;
+  msgPt.Throttle_Body_Pos = actualTorque / 3.0;
+
+  // --- PACK BRAKE MESSAGE (0x401) ---
+  msgBrake.FL_Actual_Pressure = brakePressure;
+  msgBrake.FR_Actual_Pressure = brakePressure;
+  msgBrake.Pump_Motor_Status = 1;
+  msgBrake.Brake_Fluid_Temp = 60 + (driverBrake * 15.0);
+  msgBrake.EBD_Active_Flag = 1;
+
+  // Transmit to CAN Bus
+  output(msgPt);
+  output(msgBrake);
+
+  // Re-arm timer
+  setTimer(t_PtbTx, C_TX_PERIOD_MS);
+}

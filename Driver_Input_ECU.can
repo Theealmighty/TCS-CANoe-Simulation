@@ -1,0 +1,44 @@
+/*@!Encoding:1252*/
+/*=============================================================================
+  ECU:         Driver_Input_ECU
+  File:        Driver_Input_ECU.can
+  Function:    Reads UI System Variables and broadcasts Driver_Input_Msg (0x100)
+               periodically at 50 Hz (every 20 ms).
+=============================================================================*/
+
+includes { }
+
+variables {
+  msTimer t_TxDriverMsg;        // Cyclic transmission timer
+  const int C_TX_PERIOD_MS = 20; // 20 ms interval = 50 Hz transmission rate
+}
+
+/* Run automatically when simulation starts */
+on start {
+  // Arm periodic timer
+  setTimer(t_TxDriverMsg, C_TX_PERIOD_MS);
+  write("[INIT] Driver_Input_ECU active. Cyclic 20ms transmission initiated.");
+}
+
+/* Cyclic timer callback */
+on timer t_TxDriverMsg {
+  message Driver_Input_Msg txMsg;
+
+  // 1. Fetch values directly from System Variables (Panel UI)
+  txMsg.Throttle_Pos     = @TCS_Vars::SysVar_Throttle;
+  txMsg.Brake_Pedal_pos  = @TCS_Vars::SysVar_BrakePedal;
+  txMsg.Steering_Angle   = @TCS_Vars::SysVar_SteeringAngle;
+  txMsg.Surface_Mu       = @TCS_Vars::SysVar_SurfaceMu;
+  txMsg.Drive_Mode       = @TCS_Vars::SysVar_DriveMode;
+  txMsg.TCS_Off_Switch   = @TCS_Vars::SysVar_TCS_Disable;
+
+  // 2. Ignition status now comes from the panel's Ignition combo box
+  //    (0 = Off, 1 = Accessory, 2 = On)
+  txMsg.Ignition_Status  = @TCS_Vars::SysVar_Ignition;
+
+  // 3. Transmit the message onto the CAN bus
+  output(txMsg);
+
+  // 4. Re-arm the timer for the next cycle
+  setTimer(t_TxDriverMsg, C_TX_PERIOD_MS);
+}
